@@ -6,20 +6,20 @@
 ![GORM](https://img.shields.io/badge/GORM-ORM-red?style=flat)
 ![Gin](https://img.shields.io/badge/Gin-Web_Framework-00ADD8?style=flat&logo=go)
 
-
 **OmniFlow** 是一个基于 **Temporal** 和 **Go** 构建的、具备高可靠性的分布式订单履约引擎。
-本项目演示了如何在微服务架构下，通过 **Saga 模式** 解决分布式事务问题，利用 **MySQL 悲观锁** 解决高并发库存扣减问题，并基于 **Event Sourcing** 机制实现了长运行流程的持久化与容错。
+本项目不仅演示了 **Saga 分布式事务** 和 **MySQL 悲观锁** 的生产级实践，更包含了一套完整的 **工程化测试套件**，验证了从单元逻辑到长运行流程的正确性。
 
 ## 🚀 核心特性 (Key Features)
 
 * **💎 双数据库架构**: **Temporal (PostgreSQL)** 负责流程状态持久化，**业务层 (MySQL)** 负责资产数据存储，彻底解耦。
-* **🛡️ 强一致性幂等 (Idempotency Framework)**: 自研基于 MySQL 唯一键 + 事务原子性的 `dedup` 中间件，完美解决分布式重试导致的“资产重复扣减”问题。
-* **🔒 高并发防超卖**: 在 Activity 中集成 `SELECT ... FOR UPDATE` 悲观锁，确保在高并发秒杀场景下的库存数据准确性。
-* **🔄 分布式事务 (Saga Pattern)**: 支付失败或风控拒绝时，自动触发补偿流程（Compensations），回滚已扣减的库存。
-* **🧩 复杂流程编排**:
-    * **Child Workflows**: 实现拆单逻辑，并行处理多仓库发货（Fan-out/Fan-in）。
-    * **Human-in-the-Loop**: 大额订单自动挂起，等待人工通过 API 审核。
-    * **Durable Timers**: 基于持久化定时器的订单超时自动取消机制。
+* **🛡️ 强一致性幂等 (Idempotency Framework)**: 自研基于 MySQL 唯一键 + 事务原子性的 `dedup` 中间件，防止分布式重试导致的“资产重复扣减”。
+* **🧪 全面的工程化测试**:
+    * **Time Skipping**: 毫秒级验证“30分钟超时”逻辑，无需真实等待。
+    * **In-Memory DB**: Activity 测试集成 SQLite 内存模式，验证 SQL 逻辑而不依赖外部环境。
+    * **Mocking**: 完美解耦业务逻辑与外部依赖。
+* **🔒 高并发防超卖**: 集成 `SELECT ... FOR UPDATE` 悲观锁，确保高并发下的库存准确性。
+* **🔄 分布式事务 (Saga Pattern)**: 支付失败或风控拒绝时，自动触发补偿流程（Compensations）。
+* **🧩 复杂流程编排**: 支持子流程拆单 (Fan-out)、人工审核 (Signal) 和超时取消 (Durable Timer)。
 
 ## 🏗️ 系统架构 (Architecture)
 
@@ -27,94 +27,20 @@
 OmniFlow/
 ├── cmd/
 │   ├── api-server/      # [入口] Gin HTTP 网关 (Port 8000)
-│   └── worker/          # [入口] Temporal Worker (含 DB 初始化与自动迁移)
+│   └── worker/          # [入口] Temporal Worker (含 DB 自动迁移)
 ├── internal/
 │   ├── app/             # [业务层]
-│   │   ├── activities.go      # 包含 GORM 事务、锁机制的业务动作
-│   │   ├── workflow.go        # 主流程编排 (Saga, Signal, Timer)
-│   │   └── workflow_child.go  # 子流程 (并行发货)
-│   ├── common/          # [模型层] 通用结构体
+│   │   ├── activities.go      # 业务动作 (GORM + 锁)
+│   │   ├── workflow.go        # 流程编排 (Saga + Signal)
+│   │   ├── workflow_test.go   # [测试] 集成测试 (Mock + Time Skip)
+│   │   └── activities_test.go # [测试] 单元测试 (SQLite)
+│   ├── common/          # [模型层]
 │   └── pkg/
-│       └── dedup/       # [核心组件] 幂等性执行器中间件
-├── docker-compose.yml   # 基础设施 (MySQL 8 + Temporal + PostgreSQL)
+│       └── dedup/       # [核心组件] 幂等性中间件
+├── docker-compose.yml   # 基础设施 (MySQL 8 + Temporal)
 └── go.mod
 
 ```
-
-## 📖 核心原理解析 (Under the Hood)
-
-OmniFlow 之所以能处理长达数天的订单流程且不怕宕机，归功于 Temporal 的 **Event Sourcing (事件溯源)** 和 **Replay (重放)** 机制。
-
-### 1. 为什么 Worker 挂了流程不断？(The Replay Mechanism)
-
-在 OmniFlow 中，Workflow 代码的执行状态并不存储在 Worker 的内存中，而是以 **Event History** 的形式持久化在 Temporal Server 的数据库里。
-
-当 Worker 崩溃重启后，它会执行以下“复活”步骤：
-
-1. 从 Server 拉取该订单的完整**事件历史**。
-2. **Replay (重放)**：从第一行代码开始重新执行 Workflow 函数。
-3. **Check History**：每当遇到 `ExecuteActivity` 或 `NewTimer` 等命令时，Worker 不会真去执行，而是检查历史记录。
-* 如果历史显示“已完成”，直接使用历史结果，**快进**到下一行。
-* 如果历史显示“未执行”，则发起真正的调用。
-
-
-
-```mermaid
-sequenceDiagram
-    participant Worker as Worker (Go Code)
-    participant History as Event History (DB)
-    
-    Note over Worker: Worker 崩溃重启...
-    Worker->>History: 1. 拉取历史日志
-    History-->>Worker: [Event1: StockReserved, Event2: TimerStarted]
-    
-    Note over Worker: 2. 开始 Replay (重放)
-    Worker->>Worker: 执行 Step 1: 预占库存
-    Worker->>History: 这一步做过吗？
-    History-->>Worker: 做过了 (Event1)，结果是 nil
-    Note over Worker: 跳过 Activity，直接继续
-    
-    Worker->>Worker: 执行 Step 2: 启动定时器
-    Worker->>History: 这一步做过吗？
-    History-->>Worker: 做过了 (Event2)，定时器已在运行
-    
-    Note over Worker: Replay 结束，恢复到崩溃前状态
-    Worker->>Worker: 继续等待 Signal 或 Timer...
-
-```
-
-### 2. 定时器是如何持久化的？(Durable Timers)
-
-在代码中调用的 `workflow.NewTimer(ctx, 30*time.Minute)` **不是** 内存中的 `time.Sleep`。
-
-* 它在数据库中创建了一条“将在 30分钟后触发”的记录。
-* 即使所有服务器断电，只要数据库还在，系统重启后 Temporal Server 会扫描并发现“过期的定时器”，立即唤醒 Worker 继续执行超时逻辑。
-
----
-
-## ❓ 深度问答 (FAQ)
-
-### Q1: 为什么使用 MySQL 做幂等性，而不是 Redis？
-
-为了保证**金融级的数据一致性**。
-如果使用 Redis 做锁，会面临“Redis 写入成功但 MySQL 写入失败”的双写不一致风险。
-OmniFlow 采用 **Local Transaction Table** 模式，将“去重键的插入”与“库存扣减”放在同一个 MySQL 事务中。根据 ACID 特性，两者要么同时成功，要么同时回滚，彻底根除了数据不一致的可能性。
-
-### Q2: 既然 Workflow 是持久化的，会不会出现事件丢失？
-
-**不会。**
-Temporal 遵循 **Write-Ahead Logging** 原则。任何 Signal（信号）或 State Change（状态变更）在确认给客户端之前，必须先写入 DB（PostgreSQL）。
-
-* 如果 Worker 挂了：任务还在 Task Queue 里，会被其他 Worker 接管。
-* 如果 Server 挂了：数据在 DB 里，新启动的 Server 会读取数据恢复状态。
-* 唯一的数据丢失风险在于底层数据库（PostgreSQL/MySQL）发生物理损坏。
-
-### Q3: 为什么库存扣减要加悲观锁？
-
-Temporal 保证 Workflow 的串行执行，但 **Activities 是并发执行的**。
-在高并发抢购场景下，多个订单可能同时读取到相同的库存值（Read Skew）。我们在 GORM 中使用了 `clause.Locking{Strength: "UPDATE"}`，这对应 SQL 的 `SELECT ... FOR UPDATE`，将并发的库存扣减操作在数据库层面串行化，防止超卖。
-
----
 
 ## 🛠️ 快速开始 (Getting Started)
 
@@ -124,38 +50,90 @@ Temporal 保证 Workflow 的串行执行，但 **Activities 是并发执行的**
 docker-compose up -d
 ```
 
-*注意：首次启动 MySQL 可能需要几十秒初始化，请耐心等待。*
+### 2. 运行测试 (强烈推荐) 🔥
 
-### 2. 启动 Worker
-
-Worker 会自动连接 MySQL，创建 `products` 和 `idempotency_logs` 表，并初始化测试数据。
+在启动服务前，先验证系统逻辑的健壮性。
 
 ```bash
-go run cmd/worker/main.go
+go test ./internal/app/... -v
 ```
 
-### 3. 启动 API Server
+你将看到测试套件在 **几百毫秒** 内模拟了包括“订单超时”、“风控拒绝”、“Activity 重试失败”在内的复杂场景。
 
-启动 Web 服务监听 **8000** 端口。
+### 3. 启动服务
 
 ```bash
+# 终端 1: 启动 Worker (消费者)
+go run cmd/worker/main.go
+
+# 终端 2: 启动 API (生产者)
 go run cmd/api-server/main.go
 ```
 
-## 🧪 场景演示
+---
 
-### 场景 A: 正常下单与并发扣库
+## 🧪 测试策略深度解析 (Testing Strategy)
 
-```bash
-curl -X POST http://localhost:8000/api/v1/orders -d '{"amount": 500, "items": ["iPhone15"]}'
+本项目展示了如何对 Temporal 应用进行**分层测试**：
+
+### 1. Workflow 集成测试 (`workflow_test.go`)
+
+利用 `go.temporal.io/sdk/testsuite` 提供的内存环境。
+
+* **模拟时间**: 当 Workflow 阻塞在 `NewTimer(30*time.Minute)` 时，测试环境会自动“快进”时间，瞬间触发超时逻辑。
+* **模拟重试**: 验证 `RetryPolicy` 是否生效，以及 Activity 连续失败后的错误处理逻辑。
+* **优雅失败**: 验证 Workflow 在发生业务错误（如风控拒绝）时，能否返回正确的结构化状态（`FAILED`），而不是抛出系统异常。
+
+### 2. Activity 单元测试 (`activities_test.go`)
+
+利用 `gorm` + `sqlite` (内存模式)。
+
+* **隔离性**: 不需要连接真实的 MySQL，每次测试自动建表，跑完自动销毁。
+* **幂等性验证**: 编写了 `TestReserveInventory_Idempotency`，连续调用两次扣库函数，断言库存只减少了一次。
+
+---
+
+## 📖 核心技术原理 (Under the Hood)
+
+### 1. 为什么 Worker 挂了流程不断？(Event Sourcing)
+
+OmniFlow 不存储当前状态，只存储**事件历史 (Event History)**。
+当 Worker 重启时，它从 Server 拉取历史记录，**重放 (Replay)** 代码执行路径。
+
+* 遇到已执行过的 `Activity`，SDK 直接返回历史结果（Mock），跳过真实执行。
+* 遇到未执行的代码，才发起真正的调用。
+
+### 2. 幂等性是如何实现的？
+
+为了防止“网络超时但实际扣款成功”导致的重试重复扣款，我们使用了 **Local Transaction Table** 模式：
+
+```go
+tx.Transaction(func(tx *gorm.DB) error {
+    // 1. 尝试插入去重键 (Key: "order_123_reserve")
+    if err := tx.Create(&log); err != nil {
+        return nil // 键已存在 -> 拦截重复请求，假装成功
+    }
+    // 2. 执行业务 (扣库存)
+    return doBusinessLogic(tx)
+})
 ```
 
-### 场景 B: 大额订单风控 (Saga 回滚)
+利用数据库事务的 ACID 特性，保证“去重键插入”和“业务操作”要么同时成功，要么同时失败。
 
-```bash
-# 下单 > 10000 元
-curl -X POST http://localhost:8000/api/v1/orders -d '{"amount": 20000, "items": ["MacPro"]}'
-# 状态变为 "待风控审核"。管理员调用接口拒绝：
-curl -X POST http://localhost:8000/api/v1/orders/{ORDER_ID}/audit -d '{"action": "REJECT"}'
-# 结果: 触发 Saga 补偿，MySQL 库存自动回滚。
+### 3. 悲观锁 (Pessimistic Locking)
+
+在秒杀以外的常规高并发场景，我们使用 `SELECT ... FOR UPDATE` (GORM: `clause.Locking{Strength: "UPDATE"}`)。
+这能从数据库层面将对同一商品的并发扣减串行化，彻底根除超卖风险。
+
+---
+
+## 📝 常用 API
+
+| 动作 | 方法 | URL | 描述 |
+| --- | --- | --- | --- |
+| **下单** | POST | `/api/v1/orders` | 创建订单，触发工作流 |
+| **查询** | GET | `/api/v1/orders/:id` | 查询当前状态 (Query) |
+| **支付** | POST | `/api/v1/orders/:id/pay` | 发送支付信号 (Signal) |
+| **审核** | POST | `/api/v1/orders/:id/audit` | 发送风控结果 (Signal) |
+
 ```

@@ -22,14 +22,15 @@ func OrderFulfillmentWorkflow(ctx workflow.Context, order common.Order) (*common
 		return currentState, nil
 	})
 
-	var invActs *InventoryActivities
+	// var invActs *InventoryActivities
+	invActs := &InventoryActivities{}
 	var compensations []func(workflow.Context) error
 
 	// === Step 1: 预占库存 ===
 	currentState = "正在预占库存"
 	if err := workflow.ExecuteActivity(ctx, invActs.ReserveInventory, order).Get(ctx, nil); err != nil {
 		currentState = "库存失败"
-		return &common.OrderStatus{Status: "FAILED", Message: err.Error()}, err
+		return &common.OrderStatus{Status: "FAILED", Message: err.Error()}, nil
 	}
 
 	// 注册补偿
