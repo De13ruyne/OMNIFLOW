@@ -1,108 +1,135 @@
-# OmniFlow: Distributed E-commerce Fulfillment System
+# OmniFlow: 分布式电商履约系统 (Distributed E-commerce Fulfillment System)
 
 ![Go](https://img.shields.io/badge/Go-1%2E21%2B-00ADD8?style=flat&logo=go)
 ![Temporal](https://img.shields.io/badge/Temporal-Orchestration-blue?style=flat&logo=temporal)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker)
 
-**OmniFlow** is a robust, distributed order fulfillment engine built with **Golang** and **Temporal**. It demonstrates how to handle complex long-running business processes, distributed transactions (Saga), and human-in-the-loop interactions in a microservices architecture.
+**OmniFlow** 是一个基于 **Golang** 和 **Temporal** 构建的强健壮性分布式订单履约引擎。它演示了如何在微服务架构中处理复杂的长运行业务流程、分布式事务（Saga 模式）以及人工介入（Human-in-the-Loop）场景。
 
-## 🚀 Features
+## 🚀 核心功能 (Features)
 
-* **🛡️ Distributed Transactions (Saga Pattern):** Ensures data consistency across services. If payment fails, inventory is automatically rolled back (compensated).
-* **⏱️ Timeout & Cancellations:** Orders are automatically cancelled if payment is not received within a specified window (implemented via durable Timers).
-* **👮 Human-in-the-Loop:** High-value orders (> $10,000) automatically pause and trigger a fraud check, waiting for manual admin approval via API.
-* **🔍 Real-time Visibility:** Query the exact state of any order (e.g., "Waiting for Payment", "Shipping") instantly without database polling.
-* **⚡ Asynchronous Signaling:** Uses Temporal Signals to handle external events like Payment Confirmation and Admin Audit.
+* **🛡️ 分布式事务 (Saga 模式):** 确保跨服务的数据一致性。如果支付失败，已预占的库存会自动回滚（执行补偿操作）。
+* **⏱️ 超时与自动取消:** 如果在指定时间窗口内未收到支付，订单将自动取消并释放资源（通过持久化计时器 Timer 实现）。
+* **👮 人工介入 (Human-in-the-Loop):** 大额订单（> $10,000）会自动暂停流程并触发风控检查，无限期等待管理员通过 API 进行人工审批。
+* **🔍 实时状态可视化:** 无需轮询数据库，即可通过 Query 接口即时查询任意订单的精确内部状态（例如“待支付”、“发货中”、“待审核”）。
+* **⚡ 异步信号驱动:** 使用 Temporal Signals 处理外部异步事件，如“支付成功确认”和“管理员审核指令”。
 
-## 🏗️ Architecture
+## 🏗️ 系统架构 (Architecture)
 
-The system follows a clean architecture with clear separation of concerns:
+本系统遵循整洁架构（Clean Architecture），职责分离清晰：
 
 ```text
 OmniFlow/
 ├── cmd/
-│   ├── api-server/    # REST API Gateway (Gin) - Triggers workflows
-│   └── worker/        # Temporal Worker - Executes business logic
+│   ├── api-server/    # REST API 网关 (Gin) - 负责接收请求并触发 Workflow
+│   └── worker/        # Temporal Worker - 负责执行核心业务逻辑 (Workflows & Activities)
 ├── internal/
-│   ├── app/           # Workflow & Activity Implementations
-│   └── common/        # Shared Types & Constants
-├── docker-compose.yml # Temporal Server & PostgreSQL Infrastructure
+│   ├── app/           # Workflow 和 Activity 的具体实现逻辑
+│   └── common/        # 共享类型定义与常量
+├── docker-compose.yml # 基础设施：Temporal Server 和 PostgreSQL
 └── go.mod
+
 ```
 
-## 🛠️ Getting Started
+## 🛠️ 快速开始 (Getting Started)
 
-### Prerequisites
+### 前置要求
+
 * Go 1.21+
 * Docker & Docker Compose
 
-### 1. Start Infrastructure
-Start the Temporal Server and PostgreSQL database:
+### 1. 启动基础设施
+
+启动 Temporal Server 和 PostgreSQL 数据库：
+
 ```bash
 docker-compose up -d
-```
-*Access Temporal Web UI at: http://localhost:8080*
 
-### 2. Start the Worker
-The worker executes the workflows and activities.
+```
+
+*启动后，访问 Temporal Web UI 控制台：http://localhost:8080*
+
+### 2. 启动 Worker (消费者)
+
+Worker 负责轮询任务队列并执行具体的业务逻辑。
+
 ```bash
 go run cmd/worker/main.go
+
 ```
 
-### 3. Start the API Server
-The API server handles HTTP requests and communicates with the Temporal cluster.
+### 3. 启动 API Server (生产者)
+
+API Server 处理 HTTP 请求并与 Temporal 集群通信。
+
 ```bash
 go run cmd/api-server/main.go
+
 ```
 
 ---
 
-## 🧪 Usage Scenarios (API Examples)
+## 🧪 使用场景演练 (API Examples)
 
-### Scenario A: Happy Path (Standard Order)
-1.  **Create Order**:
-    ```bash
-    curl -X POST http://localhost:8000/api/v1/orders \
-         -d '{"amount": 500, "items": ["iPhone 15"]}'
-    ```
-    *Response: `{"order_id": "ORD-170..."}`*
+### 场景 A: 标准流程 (Happy Path)
 
-2.  **Check Status**:
-    ```bash
-    curl http://localhost:8000/api/v1/orders/ORD-170...
-    ```
-    *Status: "待支付 (超时倒计时: 30s)"*
+1. **创建订单**:
+```bash
+curl -X POST http://localhost:8000/api/v1/orders \
+     -d '{"amount": 500, "items": ["iPhone 15"]}'
 
-3.  **Simulate Payment**:
-    ```bash
-    curl -X POST http://localhost:8000/api/v1/orders/ORD-170.../pay
-    ```
-    *Status changes to: "已完成"*
+```
 
-### Scenario B: Timeout & Compensation
-1.  Create an order but **do not pay**.
-2.  Wait for 30 seconds.
-3.  Check status: *Status: "已取消 (超时)"* (Inventory is released automatically).
 
-### Scenario C: High-Value Order (Human Review)
-1.  **Create High-Value Order (> $10,000)**:
-    ```bash
-    curl -X POST http://localhost:8000/api/v1/orders \
-         -d '{"amount": 20000, "items": ["Mac Pro"]}'
-    ```
+*响应: `{"order_id": "ORD-170..."}*`
+2. **查询状态**:
+```bash
+curl http://localhost:8000/api/v1/orders/ORD-170...
 
-2.  **Check Status**:
-    *Status: "⚠️ 待风控审核 (大额订单)"* (Workflow is paused).
+```
 
-3.  **Admin Approve/Reject**:
-    ```bash
-    curl -X POST http://localhost:8000/api/v1/orders/ORD-170.../audit \
-         -d '{"action": "APPROVE"}' 
-         # Or use "REJECT" to trigger rollback
-    ```
 
-## 📚 Tech Stack
-* **Language**: Golang
-* **Orchestration**: Temporal.io
-* **Web Framework**: Gin
-* **Database**: PostgreSQL (via Temporal)
+*当前状态: "待支付 (超时倒计时: 30s)"*
+3. **模拟支付**:
+```bash
+curl -X POST http://localhost:8000/api/v1/orders/ORD-170.../pay
+
+```
+
+
+*状态变更为: "已完成"*
+
+### 场景 B: 超时与补偿 (Timeout & Compensation)
+
+1. 创建订单，但 **不进行支付**。
+2. 等待 30 秒（模拟超时）。
+3. 再次查询状态: *状态: "已取消 (超时)"* (此时后台已自动执行库存释放操作)。
+
+### 场景 C: 大额订单人工审核 (Human Review)
+
+1. **创建大额订单 (> $10,000)**:
+```bash
+curl -X POST http://localhost:8000/api/v1/orders \
+     -d '{"amount": 20000, "items": ["Mac Pro"]}'
+
+```
+
+
+2. **查询状态**:
+*当前状态: "⚠️ 待风控审核 (大额订单)"* (Workflow 已自动暂停)。
+3. **管理员审核 (通过或拒绝)**:
+```bash
+curl -X POST http://localhost:8000/api/v1/orders/ORD-170.../audit \
+     -d '{"action": "APPROVE"}' 
+     # 或者使用 "REJECT" 触发回滚
+
+```
+
+
+
+## 📚 技术栈 (Tech Stack)
+
+* **开发语言**: Golang
+* **流程编排**: Temporal.io
+* **Web 框架**: Gin
+* **数据库**: PostgreSQL (via Temporal)
