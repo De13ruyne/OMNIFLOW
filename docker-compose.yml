@@ -1,5 +1,22 @@
 version: "3.5"
 services:
+  # --- 业务数据库 (MySQL) ---
+  mysql:
+    image: mysql:8.0
+    container_name: omniflow-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=omniflow
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # --- Temporal 数据库 (PostgreSQL) ---
   postgresql:
     image: postgres:12
     container_name: temporal-postgres
@@ -11,6 +28,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # --- Temporal Server ---
   temporal:
     image: temporalio/auto-setup:latest
     container_name: temporal-server
@@ -40,3 +58,4 @@ services:
 
 volumes:
   postgres_data:
+  mysql_data:

@@ -9,7 +9,6 @@ import (
 )
 
 func OrderFulfillmentWorkflow(ctx workflow.Context, order common.Order) (*common.OrderStatus, error) {
-	// 1. 配置 Activity 选项
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout: time.Minute * 1,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
@@ -17,109 +16,87 @@ func OrderFulfillmentWorkflow(ctx workflow.Context, order common.Order) (*common
 	ctx = workflow.WithActivityOptions(ctx, ao)
 	logger := workflow.GetLogger(ctx)
 
-	// 2. 初始化状态与查询 Handler
-	currentState := "初始化中..."
-	// 设置查询处理函数，允许外部查询 currentState
-	if err := workflow.SetQueryHandler(ctx, "get_order_status", func() (string, error) {
+	// 状态查询支持
+	currentState := "初始化"
+	workflow.SetQueryHandler(ctx, "get_order_status", func() (string, error) {
 		return currentState, nil
-	}); err != nil {
-		return nil, err
-	}
+	})
 
 	var invActs *InventoryActivities
-	// 定义补偿堆栈 (用于 Saga 回滚)
 	var compensations []func(workflow.Context) error
 
-	// ------------------------------------------------------------------
-	// Step 1: 预占库存
-	// ------------------------------------------------------------------
+	// === Step 1: 预占库存 ===
 	currentState = "正在预占库存"
-	err := workflow.ExecuteActivity(ctx, invActs.ReserveInventory, order).Get(ctx, nil)
-	if err != nil {
-		currentState = "库存预占失败"
+	if err := workflow.ExecuteActivity(ctx, invActs.ReserveInventory, order).Get(ctx, nil); err != nil {
+		currentState = "库存失败"
 		return &common.OrderStatus{Status: "FAILED", Message: err.Error()}, err
 	}
 
-	// ✅ 成功后立即注册补偿：如果后续失败，需要释放库存
+	// 注册补偿
 	compensations = append(compensations, func(ctx workflow.Context) error {
 		return workflow.ExecuteActivity(ctx, invActs.ReleaseInventory, order).Get(ctx, nil)
 	})
 
-	// ------------------------------------------------------------------
-	// Step 2: 人工风控审核 (仅针对大额订单 > 10000)
-	// ------------------------------------------------------------------
+	// === Step 2: 风控 (大额订单) ===
 	if order.Amount > 10000 {
-		currentState = "⚠️ 待风控审核 (大额订单)"
-		logger.Info("触发风控，等待管理员审核...")
-
-		var adminAction string
-		signalChan := workflow.GetSignalChannel(ctx, "SIGNAL_ADMIN_ACTION")
-		signalChan.Receive(ctx, &adminAction) // 阻塞等待信号
-
-		if adminAction == "REJECT" {
-			currentState = "审核拒绝，正在回滚..."
-			// 执行补偿
+		currentState = "⚠️ 待风控审核"
+		var action string
+		workflow.GetSignalChannel(ctx, "SIGNAL_ADMIN_ACTION").Receive(ctx, &action)
+		if action == "REJECT" {
 			rollback(ctx, compensations)
-			currentState = "已关闭 (风控拒绝)"
-			return &common.OrderStatus{Status: "REJECTED", Message: "管理员拒绝"}, nil
+			currentState = "已拒绝"
+			return &common.OrderStatus{Status: "REJECTED"}, nil
 		}
-		logger.Info("管理员审核通过")
 	}
 
-	// ------------------------------------------------------------------
-	// Step 3: 等待支付 (超时自动取消)
-	// ------------------------------------------------------------------
-	currentState = "待支付 (超时倒计时: 30s)"
-	logger.Info("等待支付信号...")
-
-	var paymentSignal string
-	paymentCh := workflow.GetSignalChannel(ctx, "SIGNAL_PAYMENT_PAID")
-
+	// === Step 3: 支付 (含超时) ===
+	currentState = "待支付 (30s超时)"
 	selector := workflow.NewSelector(ctx)
 	hasPaid := false
 
-	// 分支 A: 收到支付信号
-	selector.AddReceive(paymentCh, func(c workflow.ReceiveChannel, more bool) {
-		c.Receive(ctx, &paymentSignal)
+	selector.AddReceive(workflow.GetSignalChannel(ctx, "SIGNAL_PAYMENT_PAID"), func(c workflow.ReceiveChannel, more bool) {
+		c.Receive(ctx, nil)
 		hasPaid = true
 	})
-
-	// 分支 B: 定时器超时 (测试用30秒)
 	selector.AddFuture(workflow.NewTimer(ctx, 30*time.Second), func(f workflow.Future) {
-		logger.Info("支付超时定时器触发")
+		logger.Info("超时触发")
 	})
 
-	// 阻塞等待
 	selector.Select(ctx)
 
 	if !hasPaid {
-		currentState = "超时未支付，正在回滚..."
 		rollback(ctx, compensations)
 		currentState = "已取消 (超时)"
-		return &common.OrderStatus{Status: "CANCELLED", Message: "支付超时"}, nil
+		return &common.OrderStatus{Status: "CANCELLED"}, nil
 	}
 
-	// ------------------------------------------------------------------
-	// Step 4: 流程完成
-	// ------------------------------------------------------------------
-	currentState = "支付成功，准备发货"
-	// 这里可以继续添加发货 Activity...
-	workflow.Sleep(ctx, time.Second*2) // 模拟发货耗时
+	// === Step 4: 拆单 (子流程) ===
+	currentState = "拆单发货中"
+	// 模拟拆成两个包裹
+	pkgs := []common.Shipment{
+		{ShipmentID: order.OrderID + "-A", OrderID: order.OrderID, Warehouse: "Shanghai"},
+		{ShipmentID: order.OrderID + "-B", OrderID: order.OrderID, Warehouse: "Guangzhou"},
+	}
+
+	var futures []workflow.ChildWorkflowFuture
+	for _, p := range pkgs {
+		cwo := workflow.ChildWorkflowOptions{WorkflowID: "SHIP_" + p.ShipmentID}
+		futures = append(futures, workflow.ExecuteChildWorkflow(workflow.WithChildOptions(ctx, cwo), ShippingChildWorkflow, p))
+	}
+
+	for _, f := range futures {
+		if err := f.Get(ctx, nil); err != nil {
+			return nil, err
+		}
+	}
 
 	currentState = "已完成"
-	return &common.OrderStatus{Status: "COMPLETED", Message: "订单履约完成"}, nil
+	return &common.OrderStatus{Status: "COMPLETED"}, nil
 }
 
-// 辅助函数：执行 Saga 补偿
 func rollback(ctx workflow.Context, compensations []func(workflow.Context) error) {
-	// 使用 DisconnectedContext 确保即使父 Context 取消也能执行
 	dCtx, _ := workflow.NewDisconnectedContext(ctx)
-	// 重新附加 Activity 选项
-	dCtx = workflow.WithActivityOptions(dCtx, workflow.ActivityOptions{
-		StartToCloseTimeout: time.Minute * 1,
-	})
-
-	// 倒序执行
+	dCtx = workflow.WithActivityOptions(dCtx, workflow.ActivityOptions{StartToCloseTimeout: time.Minute})
 	for i := len(compensations) - 1; i >= 0; i-- {
 		_ = compensations[i](dCtx)
 	}

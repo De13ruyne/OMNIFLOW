@@ -9,8 +9,15 @@ type Order struct {
 	CustomerID string
 }
 
+type Shipment struct {
+	ShipmentID string
+	OrderID    string
+	Warehouse  string
+	Items      []string
+}
+
 type OrderStatus struct {
 	OrderID string
-	Status  string // COMPLETED, FAILED, CANCELLED, REJECTED
+	Status  string
 	Message string
 }

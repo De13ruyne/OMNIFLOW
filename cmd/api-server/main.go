@@ -18,86 +18,60 @@ func main() {
 	var err error
 	temporalClient, err = client.Dial(client.Options{HostPort: "127.0.0.1:7233"})
 	if err != nil {
-		log.Fatalln("无法连接 Temporal Server", err)
+		log.Fatalln("Temporal 连接失败:", err)
 	}
 	defer temporalClient.Close()
 
 	r := gin.Default()
-
-	// 路由定义
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/orders", createOrder)          // 下单
-		v1.GET("/orders/:id", getOrderStatus)    // 查询状态
-		v1.POST("/orders/:id/pay", payOrder)     // 模拟支付
-		v1.POST("/orders/:id/audit", auditOrder) // 管理员审核
+		v1.POST("/orders", createOrder)
+		v1.GET("/orders/:id", getStatus)
+		v1.POST("/orders/:id/pay", payOrder)
+		v1.POST("/orders/:id/audit", auditOrder)
 	}
 
 	log.Println("API Server 监听 :8000")
 	r.Run(":8000")
 }
 
-// --- Handlers ---
-
 func createOrder(c *gin.Context) {
 	var req struct {
 		Amount int      `json:"amount"`
 		Items  []string `json:"items"`
 	}
-	if err := c.BindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request"})
-		return
-	}
-
+	c.BindJSON(&req)
 	orderID := fmt.Sprintf("ORD-%d", time.Now().Unix())
 	order := common.Order{OrderID: orderID, Amount: req.Amount, Items: req.Items}
 
-	opt := client.StartWorkflowOptions{
-		ID:        "WORKFLOW_" + orderID,
-		TaskQueue: common.TaskQueue,
-	}
+	_, err := temporalClient.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID: "WORKFLOW_" + orderID, TaskQueue: common.TaskQueue,
+	}, app.OrderFulfillmentWorkflow, order)
 
-	_, err := temporalClient.ExecuteWorkflow(context.Background(), opt, app.OrderFulfillmentWorkflow, order)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-
-	c.JSON(200, gin.H{"order_id": orderID, "msg": "Order Created"})
+	c.JSON(200, gin.H{"order_id": orderID})
 }
 
-func getOrderStatus(c *gin.Context) {
-	workflowID := "WORKFLOW_" + c.Param("id")
-	val, err := temporalClient.QueryWorkflow(context.Background(), workflowID, "", "get_order_status")
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Query failed", "details": err.Error()})
-		return
-	}
+func getStatus(c *gin.Context) {
+	val, _ := temporalClient.QueryWorkflow(context.Background(), "WORKFLOW_"+c.Param("id"), "", "get_order_status")
 	var status string
 	val.Get(&status)
-	c.JSON(200, gin.H{"order_id": c.Param("id"), "status": status})
+	c.JSON(200, gin.H{"status": status})
 }
 
 func payOrder(c *gin.Context) {
-	workflowID := "WORKFLOW_" + c.Param("id")
-	err := temporalClient.SignalWorkflow(context.Background(), workflowID, "", "SIGNAL_PAYMENT_PAID", "PAID")
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"msg": "Payment Signal Sent"})
+	temporalClient.SignalWorkflow(context.Background(), "WORKFLOW_"+c.Param("id"), "", "SIGNAL_PAYMENT_PAID", nil)
+	c.JSON(200, gin.H{"msg": "Signal Sent"})
 }
 
 func auditOrder(c *gin.Context) {
-	workflowID := "WORKFLOW_" + c.Param("id")
 	var req struct {
-		Action string `json:"action"` // APPROVE or REJECT
+		Action string `json:"action"`
 	}
 	c.BindJSON(&req)
-	err := temporalClient.SignalWorkflow(context.Background(), workflowID, "", "SIGNAL_ADMIN_ACTION", req.Action)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"msg": "Audit Signal Sent"})
+	temporalClient.SignalWorkflow(context.Background(), "WORKFLOW_"+c.Param("id"), "", "SIGNAL_ADMIN_ACTION", req.Action)
+	c.JSON(200, gin.H{"msg": "Audit Sent"})
 }
