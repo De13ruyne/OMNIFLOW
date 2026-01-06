@@ -1,5 +1,4 @@
 version: "3.5"
-
 services:
   postgresql:
     image: postgres:12
@@ -24,8 +23,7 @@ services:
       - POSTGRES_USER=temporal
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=postgresql
-      # ⚠️ 我删除了 DYNAMIC_CONFIG_FILE_PATH 这一行，这是罪魁祸首
-      - SKIP_DEFAULT_NAMESPACE_CREATION=false 
+      - SKIP_DEFAULT_NAMESPACE_CREATION=false
     depends_on:
       - postgresql
 
