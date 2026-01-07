@@ -1,0 +1,11 @@
+# config/prometheus/prometheus.yml
+global:
+  scrape_interval: 5s # 每5秒抓一次，为了测试效果明显，设短一点
+
+scrape_configs:
+  - job_name: 'omniflow-worker'
+    metrics_path: '/metrics'
+    static_configs:
+      #如果你是在 Mac/Windows 上运行 Go 代码，请使用 host.docker.internal
+      #如果你是在 Linux 上直接运行，可能需要用 localhost 或本机 IP
+      - targets: ['host.docker.internal:9091']

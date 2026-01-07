@@ -1,4 +1,4 @@
-# OmniFlow v2.5: 生产级分布式电商履约系统
+<!-- # OmniFlow v2.5: 生产级分布式电商履约系统
 
 ![Go](https://img.shields.io/badge/Go-1%2E21+-00ADD8?style=flat&logo=go)
 ![Temporal](https://img.shields.io/badge/Temporal-Orchestration-blue?style=flat&logo=temporal)
@@ -136,4 +136,198 @@ tx.Transaction(func(tx *gorm.DB) error {
 | **支付** | POST | `/api/v1/orders/:id/pay` | 发送支付信号 (Signal) |
 | **审核** | POST | `/api/v1/orders/:id/audit` | 发送风控结果 (Signal) |
 
+
+ -->
+
+
+
+# OmniFlow: 分布式电商履约与高并发秒杀引擎 (v2.5)
+
+## 1. 项目概述 (Executive Summary)
+
+**OmniFlow** 是一个基于 **Go** 语言和 **Temporal** 工作流引擎构建的企业级电商履约系统。该项目旨在解决传统单体架构在**高并发秒杀**和**长链路分布式事务**场景下的痛点。
+
+通过引入 **"三层漏斗" (3-Layer Funnel)** 架构，OmniFlow 实现了流量的逐级清洗与削峰，在保证数据强一致性（ACID）的同时，单机环境实测达到了 **13,000+ QPS** 的吞吐能力。
+
+* **核心特性**：分布式 Saga 事务、高并发秒杀、库存强一致性、全链路可观测性。
+* **技术栈**：Golang, Temporal (Workflow), Redis (Lua Scripting), MySQL (GORM), Prometheus, Grafana.
+
+---
+
+## 2. 系统架构设计 (System Architecture)
+
+OmniFlow 摒弃了传统的同步调用链，采用了**事件驱动**与**编排式 (Orchestration)** 相结合的架构。核心设计理念是 **"流量漏斗"** 模型。
+
+### 2.1 三层漏斗模型 (The 3-Layer Funnel)
+
+系统将请求处理分为三个层级，每一层都有明确的职责和过滤机制：
+
+| 层级 | 组件 | 职责 | 核心技术 | QPS 承载级 |
+| --- | --- | --- | --- | --- |
+| **L1 拦截层** | **API Server + Redis** | 流量整形、库存预扣减、快速失败 | **Lua 原子脚本** | 10,000+ |
+| **L2 编排层** | **Temporal Cluster** | 状态管理、流程编排、重试与超时 | **Event Sourcing** | 1,000+ |
+| **L3 数据层** | **MySQL + Worker** | 资产落地、强一致性校验、持久化 | **悲观锁 (For Update)** | 100+ |
+
+---
+
+## 3. 核心业务流程详解 (Core Business Scenarios)
+
+### 3.1 高并发秒杀场景 (High Concurrency Flash Sale)
+
+**挑战**：在数万用户瞬间抢购少量库存（如 10 台 iPhone）时，防止数据库因连接耗尽而崩溃，并杜绝超卖。
+
+**处理流程**：
+
+1. **原子资格校验 (Redis Lua)**:
+* API 接收请求，直接执行 Redis Lua 脚本。
+* 脚本原子性地执行 `Check And Decr`。若库存不足，直接返回 `429 Too Many Requests`。
+* **效果**：99.9% 的无效流量在这一层被拦截，无需触达数据库。
+
+
+2. **异步削峰 (Async Hand-off)**:
+* 获得资格的请求，API Server 仅负责向 Temporal 提交 Workflow 启动指令。
+* 立即向前端返回 `200 OK` (排队中)，实现 HTTP 线程的快速释放。
+
+
+
+### 3.2 分布式库存扣减 (Reliable Inventory Reservation)
+
+**挑战**：在分布式环境下，如何保证库存扣减的准确性，且支持幂等（防重复扣减）。
+
+**处理流程**：
+
+1. **Workflow 调度**: Temporal Worker 领取任务，执行 `ReserveInventory` Activity。
+2. **数据库悲观锁**:
+```sql
+START TRANSACTION;
+-- 1. 幂等性检查 (利用唯一索引)
+INSERT INTO idempotency_logs (key) VALUES ('order_123_reserve');
+-- 2. 锁定行
+SELECT stock FROM products WHERE id='iPhone15' FOR UPDATE;
+-- 3. 扣减
+UPDATE products SET stock = stock - 1 WHERE id='iPhone15';
+COMMIT;
+
 ```
+
+
+3. **结果**: 即使 Worker 在 Commit 后崩溃，Temporal 的重试机制配合数据库的幂等记录，保证了操作的 **Exactly-Once** 语义。
+
+### 3.3 超时自动取消与 Saga 补偿 (Timeout & Saga Compensation)
+
+**挑战**：用户锁定库存后可能放弃支付，系统需在 30 分钟后自动释放库存，不能依赖轮询数据库（性能差）。
+
+**处理流程**：
+
+1. **零资源挂起**: Workflow 调用 `selector.AddFuture(workflow.NewTimer(30*time.Minute))`。此时 Worker 卸载内存，仅仅在 Temporal DB 中保留一条 Event 记录。
+2. **竞态路由 (Race Condition)**:
+* **分支 A (支付成功)**: 收到 `Signal`，取消定时器，推进流程。
+* **分支 B (超时)**: 定时器触发，执行 **Saga 补偿逻辑**。
+
+
+3. **补偿执行**:
+* 调用逆向 Activity `ReleaseInventory`。
+* 将 MySQL 库存回滚，并标记订单为 `CANCELLED`。
+
+
+
+---
+
+## 4. 关键技术难点与解决方案 (Engineering Challenges)
+
+### 4.1 解决“超卖”问题的多重防线
+
+* **第一道防线 (Redis)**: 利用 Redis 单线程特性 + Lua 脚本原子性，粗粒度拦截流量。
+* **第二道防线 (MySQL)**: 利用 InnoDB 引擎的 `SELECT ... FOR UPDATE` 行锁，确保并发下的最终数据准确性。
+
+### 4.2 为什么选择 Temporal 而不是 Kafka/RabbitMQ？
+
+* **状态可见性**: MQ 是“发后即忘”的，难以追踪订单当前处于“拆单中”还是“等待支付”。Temporal 原生提供状态查询。
+* **复杂度治理**: 在 MQ 中实现“30分钟超时 + 补偿”需要引入死信队列和定时任务，逻辑分散。Temporal 通过代码逻辑（`Sleep`）即可实现，逻辑内聚且易于维护。
+
+### 4.3 压测性能报告 (Performance Benchmark)
+
+在单机 Docker 环境（4 Core, 8GB RAM）下，使用 `stress_runner` 进行 2000 并发测试：
+
+* **配置**:
+* Redis 连接池: 200
+* HTTP Client Keep-Alive: Enabled
+* `ulimit -n`: 10240
+
+
+* **结果**:
+* **QPS**: **12,995 req/sec**
+* **库存准确性**: 预设 10 库存，成功 10 单，拦截 1990 单。**零超卖**。
+
+
+
+---
+
+## 5. 项目代码结构 (Project Structure)
+
+遵循 Golang 标准工程布局 (Standard Go Project Layout)：
+
+```text
+OmniFlow/
+├── cmd/
+│   ├── api-server/      # [入口] HTTP API，集成 Redis 漏斗
+│   └── worker/          # [后端] Temporal Worker，处理 MySQL 事务
+├── internal/
+│   ├── app/
+│   │   ├── workflow.go  # [核心] Saga 编排与超时逻辑
+│   │   └── activities.go# [原子] 数据库 CRUD 操作
+│   ├── pkg/
+│   │   ├── store/       # [组件] Redis 客户端与 Lua 脚本封装
+│   │   └── dedup/       # [组件] 幂等性 SDK
+│   └── common/          # [共享] 类型定义
+└── docker-compose.yml   # 基础设施编排 (Redis, MySQL, Temporal, Grafana)
+
+```
+
+---
+
+## 6. API 接口文档 (API Reference)
+
+### 创建订单 (秒杀)
+
+**POST** `/api/v1/orders`
+
+**Request:**
+
+```json
+{
+  "amount": 100,
+  "items": ["iPhone15"]
+}
+
+```
+
+**Response (Success):**
+
+```json
+{
+  "message": "抢购成功，正在排队处理中...",
+  "order_id": "ORDER-550e8400-e29b...",
+  "run_id": "a3f29b..."
+}
+
+```
+
+**Response (Throttled):**
+
+```json
+{
+  "error": "手慢了，库存不足！"
+}
+
+```
+
+*状态码: 429 Too Many Requests*
+
+---
+
+## 7. 未来演进规划 (Roadmap)
+
+1. **通知中心**: 解耦通知渠道，支持邮件、短信、Webhook 插件化。
+2. **财务对账**: 利用 Cron Workflow 实现 Redis 与 MySQL 库存的每日自动对账与红冲蓝补。
+3. **微服务拆分**: 将 Order 与 Inventory 拆分为独立 Worker，独立扩容。

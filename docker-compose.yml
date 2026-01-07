@@ -1,5 +1,37 @@
 version: "3.5"
 services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: omniflow-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 1. Prometheus (数据采集)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: omniflow-prometheus
+    volumes:
+      - ./config/prometheus:/etc/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # 允许容器访问宿主机 (因为你的 Go 代码是在本机跑的)
+
+  # 2. Grafana (数据展示)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: omniflow-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # 登录密码
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
   # --- 业务数据库 (MySQL) ---
   mysql:
     image: mysql:8.0
@@ -59,3 +91,4 @@ services:
 volumes:
   postgres_data:
   mysql_data:
+
